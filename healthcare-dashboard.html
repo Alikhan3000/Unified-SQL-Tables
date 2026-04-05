@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HealthDataBot</title>
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #f9fafb;
+      --border: #e5e7eb;
+      --text: #111827;
+      --muted: #6b7280;
+      --accent: #0f766e;
+      --accent-dark: #115e59;
+      --accent-soft: #ccfbf1;
+      --danger: #b91c1c;
+      --shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }
+
+    .metric-card {
+      background: linear-gradient(180deg, #ffffff 0%, #fbfbfc 100%);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 20px;
+      box-shadow: var(--shadow);
+    }
+
+    .input {
+      width: 100%;
+      border: 1px solid #d1d5db;
+      border-radius: 14px;
+      padding: 16px 18px;
+      font-size: 16px;
+      outline: none;
+      transition: 0.2s ease;
+      background: white;
+    }
+
+    .input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.10);
+    }
+
+    .btn {
+      border: none;
+      border-radius: 14px;
+      padding: 14px 20px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: 0.2s ease;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-dark);
+    }
+
+    .muted { color: var(--muted); }
+
+    .result-pre {
+      white-space: pre-wrap;
+      line-height: 1.65;
+      font-size: 14px;
+      color: #1f2937;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    @media (max-width: 900px) {
+      .layout {
+        grid-template-columns: 1fr !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    function App() {
+      const [query, setQuery] = useState('');
+      const [loading, setLoading] = useState(false);
+      const [statsLoading, setStatsLoading] = useState(true);
+      const [stats, setStats] = useState(null);
+      const [results, setResults] = useState([]);
+      const [error, setError] = useState('');
+
+      useEffect(() => {
+        loadStats();
+      }, []);
+
+      const loadStats = async () => {
+        try {
+          setStatsLoading(true);
+          const res = await fetch('http://localhost:5000/api/stats');
+          if (!res.ok) throw new Error('Stats request failed');
+          const data = await res.json();
+          setStats(data);
+        } catch (err) {
+          setError('Unable to load dashboard metrics. Confirm the API is running on port 5000.');
+        } finally {
+          setStatsLoading(false);
+        }
+      };
+
+      const search = async () => {
+        if (!query.trim()) return;
+
+        try {
+          setLoading(true);
+          setError('');
+          const res = await fetch('http://localhost:5000/api/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query })
+          });
+
+          if (!res.ok) throw new Error('Search request failed');
+
+          const data = await res.json();
+          setResults(data.results || []);
+        } catch (err) {
+          setError('Search failed. Confirm api.py is running and reachable on port 5000.');
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      return (
+        <div className="min-h-screen px-6 py-8">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-8">
+              <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+                <div>
+                  <div className="text-sm tracking-[0.18em] uppercase muted mb-2">Clinical Intelligence Platform</div>
+                  <h1 className="text-4xl md:text-5xl font-semibold tracking-tight">HealthDataBot</h1>
+                  <p className="mt-3 text-base muted max-w-2xl">
+                    Unified analytics across relational healthcare records and semantic clinical note search.
+                  </p>
+                </div>
+                <div className="card px-5 py-4">
+                  <div className="text-sm muted">System Status</div>
+                  <div className="mt-1 text-sm font-medium">MySQL · Milvus · API</div>
+                </div>
+              </div>
+            </header>
+
+            <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4 mb-8">
+              <MetricCard label="Patients" value={statsLoading ? '—' : formatNumber(stats?.patients)} />
+              <MetricCard label="Encounters" value={statsLoading ? '—' : formatNumber(stats?.encounters)} />
+              <MetricCard label="Abnormal Labs" value={statsLoading ? '—' : formatNumber(stats?.labs)} />
+              <MetricCard label="Medications" value={statsLoading ? '—' : formatNumber(stats?.meds)} />
+              <MetricCard label="Indexed Notes" value={statsLoading ? '—' : formatNumber(stats?.notes)} />
+            </section>
+
+            <div className="layout grid grid-cols-[1.2fr_0.8fr] gap-6">
+              <section className="card p-6">
+                <div className="flex items-start justify-between gap-4 mb-5">
+                  <div>
+                    <h2 className="text-xl font-semibold">Search Workspace</h2>
+                    <p className="muted mt-1 text-sm">
+                      Use natural language for note retrieval, semantic matches, and database-driven responses.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-col md:flex-row gap-3">
+                  <input
+                    className="input"
+                    placeholder="Example: chest pain notes, diabetes complications, abnormal labs"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && search()}
+                  />
+                  <button className="btn btn-primary md:min-w-[140px]" onClick={search} disabled={loading}>
+                    {loading ? 'Searching...' : 'Run Search'}
+                  </button>
+                </div>
+
+                {error && (
+                  <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm" style={{color:'#991b1b'}}>
+                    {error}
+                  </div>
+                )}
+
+                <div className="mt-6">
+                  <div className="text-sm font-medium mb-3">Response</div>
+                  {results.length === 0 ? (
+                    <div className="rounded-2xl border border-dashed border-gray-300 bg-gray-50 p-8 text-sm muted">
+                      No response yet. Submit a query to see clinical note matches or structured database results.
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      {results.map((item, index) => (
+                        <div key={index} className="rounded-2xl border border-gray-200 bg-white p-5">
+                          <div className="flex items-center justify-between gap-3 mb-3">
+                            <div className="font-semibold">{item.title || 'Search Result'}</div>
+                            <span className="text-xs uppercase tracking-wider muted">{item.type || 'response'}</span>
+                          </div>
+                          <div className="result-pre">{item.content}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </section>
+
+              <section className="space-y-6">
+                <div className="card p-6">
+                  <h3 className="text-lg font-semibold mb-4">Suggested Queries</h3>
+                  <div className="space-y-3">
+                    {[
+                      'chest pain notes',
+                      'diabetes notes',
+                      'abnormal labs',
+                      'recent encounters',
+                      'patients by city'
+                    ].map((sample) => (
+                      <button
+                        key={sample}
+                        onClick={() => setQuery(sample)}
+                        className="w-full text-left rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm hover:bg-gray-100 transition"
+                      >
+                        {sample}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+            <div className="card p-6">
+  <h3 className="text-lg font-semibold mb-4">Platform Notes</h3>
+  <div className="space-y-4 text-sm muted">
+    <p>Use semantic queries for clinical note retrieval through Milvus.</p>
+    <p>Use structured queries like abnormal labs and recent encounters for relational results.</p>
+    <p>For best performance, keep the Flask API and local database services running while using the dashboard.</p>
+  </div>
+</div>
+              </section>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function MetricCard({ label, value }) {
+      return (
+        <div className="metric-card">
+          <div className="text-sm muted">{label}</div>
+          <div className="mt-2 text-3xl font-semibold tracking-tight">{value ?? '-'}</div>
+        </div>
+      );
+    }
+
+    function formatNumber(v) {
+      if (v === null || v === undefined) return '-';
+      return Number(v).toLocaleString();
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
