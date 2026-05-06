@@ -4,7 +4,7 @@ import os
 from typing import List, Dict
 
 class DatabaseSetup:
-    def __init__(self, db_path: str = "./data/company_data.db"):
+    def __init__(self, db_path: str = "./data/comqpany_data.db"):
         self.db_path = db_path
         self.ensure_data_directory()
         
@@ -88,5 +88,8 @@ class DatabaseSetup:
             ('Amazon Echo Dot', 'Electronics', 49.99, 75, 'Smart home device'),
         ]
         
-        # Insert products
-        for product in products
+        for product in products_data:
+            cursor.execute(
+        "INSERT INTO products (name, category, price, stock_quantity, description) VALUES (?, ?, ?, ?, ?)",
+        product
+    )

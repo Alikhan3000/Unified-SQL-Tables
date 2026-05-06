@@ -3,370 +3,519 @@ from milvus_handler import MilvusHandler
 import requests
 import os
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
-import re
+from datetime import datetime
+from rapidfuzz import fuzz
 
 load_dotenv()
+
 
 class HealthcareChatbot:
     def __init__(self):
         self.name = "🏥 HealthDataBot Pro"
         self.db = DatabaseHandler()
-        self.milvus = MilvusHandler()
-        self.ollama_url = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
-        self.model = os.getenv('OLLAMA_MODEL', 'llama3.2')
-        
+        self.milvus = None
+        self.ollama_url = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        self.model = os.getenv("OLLAMA_MODEL", "llama3.2")
+
         print(f"🚀 Initializing {self.name}...")
         print("✅ Connected to MySQL unified database!")
         self.print_table_stats()
-        print("🧠 Connected to Milvus (836 clinical note embeddings)")
+
+        try:
+            self.milvus = MilvusHandler()
+            print("🧠 Connected to Milvus")
+        except Exception as e:
+            print(f"⚠️ Milvus unavailable, semantic search disabled: {e}")
+            self.milvus = None
+
         print("💡 Ready for SQL + semantic search! Type 'help' to start\n")
-    
-    def print_table_stats(self):
-        """Show database health at startup"""
-        print("📋 Checking tables:")
-        tables = {
-            'patient_demographics': 1000,
-            'patient_socioeconomic': 1000, 
-            'remote_device_reading': 1000,
-            'ehr_encounter': 1000,
-            'lab_result': 500,
-            'pharmacy_medication': 1000,
-            'procedure_record': 250,
-            'claims_encounter': 1000
-        }
-        for table, count in tables.items():
-            print(f"   ✅ {table}: {count:,} rows")
-    
+
+    def fuzzy_contains_intent(self, user_input, phrases, threshold=80):
+        text = (user_input or "").lower().strip()
+
+        for phrase in phrases:
+            phrase = phrase.lower().strip()
+
+            if phrase in text:
+                return True
+
+            score1 = fuzz.partial_ratio(text, phrase)
+            score2 = fuzz.token_set_ratio(text, phrase)
+            score3 = fuzz.partial_token_ratio(text, phrase)
+
+            if max(score1, score2, score3) >= threshold:
+                return True
+
+        return False
+
+    def is_note_query(self, user_input: str) -> bool:
+        text = (user_input or "").lower().strip()
+
+        note_keywords = [
+            "note", "notes", "clinical", "chart", "record", "history",
+            "symptom", "symptoms", "complaint", "complaints",
+            "assessment", "plan", "soap", "hpi"
+        ]
+
+        symptom_keywords = [
+            "chest pain", "shortness of breath", "chest pressure", "chest tightness",
+            "diabetes", "hypertension", "hypotension", "fever", "cough",
+            "headache", "dizziness", "nausea", "vomiting", "fatigue",
+            "wheezing", "palpitations", "edema", "dyspnea"
+        ]
+
+        if any(k in text for k in note_keywords):
+            return True
+
+        if any(k in text for k in symptom_keywords):
+            return True
+
+        return self.fuzzy_contains_intent(text, note_keywords + symptom_keywords, threshold=75)
+
     def ask_ollama(self, prompt, timeout=90):
-        """Enhanced Ollama with better error handling"""
         try:
             response = requests.post(
-                f"{self.ollama_url}/api/generate", 
+                f"{self.ollama_url}/api/generate",
                 json={
                     "model": self.model,
                     "prompt": prompt,
                     "stream": False,
                     "options": {
-                        "temperature": 0.1,  # More deterministic for SQL
+                        "temperature": 0.1,
                         "top_p": 0.9
                     }
-                }, 
+                },
                 timeout=timeout
             )
             if response.status_code == 200:
-                return response.json()['response'].strip()
+                return response.json()["response"].strip()
         except requests.exceptions.Timeout:
             return None
         except Exception as e:
             print(f"❌ Ollama error: {e}")
             return None
-    
+        return None
+
+    def print_table_stats(self):
+        print("📋 Checking tables:")
+        tables = {
+            "patient_demographics": 1000,
+            "patient_socioeconomic": 1000,
+            "remote_device_reading": 1000,
+            "ehr_encounter": 1000,
+            "lab_result": 500,
+            "pharmacy_medication": 1000,
+            "procedure_record": 250,
+            "claims_encounter": 1000
+        }
+        for table, count in tables.items():
+            print(f"   ✅ {table}: {count:,} rows")
+
     def semantic_search_notes(self, query, limit=5):
-        """Milvus semantic search for clinical notes"""
+        if not self.milvus:
+            return None
+
         try:
-            print("🧠 Searching 836 clinical notes in Milvus...")
+            print(f"🧠 Semantic search: {query}")
             results = self.milvus.search_notes(query, limit=limit)
-            
+
             if not results:
-                return "✅ No similar clinical notes found"
-            
-            output = f"🧠 **Found {len(results)} similar clinical notes:**\n\n"
+                return None
+
+            output = f"🧠 **{len(results)} similar clinical notes for:** `{query}`\n\n"
             for i, r in enumerate(results, 1):
-                preview = r['note_text'][:200].replace("\n", " ").strip()
-                source = r['source_table'].replace('_', ' ').title()
-                output += f"{i}. **Patient {r['patient_id']}** ({source} #{r['source_record_id']})\n"
-                output += f"   📊 Distance: {r['distance']:.3f} | {preview}...\n\n"
-            
-            print(f"✅ Milvus returned {len(results)} results")
+                patient_id = r.get("patient_id", "N/A")
+                encounter_type = r.get("encounter_type", "Unknown")
+                encounter_start = r.get("encounter_start", "N/A")
+                chief_complaint = r.get("chief_complaint", "N/A")
+                distance = r.get("distance", 0.0)
+
+                preview = (r.get("note_text", "") or "").replace("\n", " ").strip()
+                if len(preview) > 200:
+                    preview = preview[:200] + "..."
+
+                output += f"{i}. **Pt {patient_id}** | {encounter_type} | {encounter_start}\n"
+                output += f"   🩺 {chief_complaint}\n"
+                output += f"   📊 Distance: {distance:.3f}\n"
+                output += f"   💬 {preview}\n\n"
+
             return output
-            
         except Exception as e:
-            return f"❌ Milvus error: {str(e)}"
-    
+            print(f"⚠️ Milvus search failed: {e}")
+            return None
+
+    def build_note_token_query(self, user_input, limit=5):
+        text = (user_input or "").lower().strip()
+
+        stopwords = {
+            "note", "notes", "clinical", "chart", "record", "records",
+            "show", "find", "search", "for", "with", "about", "the",
+            "a", "an", "and", "or", "of", "patient", "patients"
+        }
+
+        tokens = [t.strip() for t in text.replace(",", " ").split()]
+        tokens = [t for t in tokens if len(t) > 2 and t not in stopwords]
+
+        if not tokens:
+            tokens = [text]
+
+        safe_tokens = [t.replace("'", "''") for t in tokens]
+
+        where_parts = []
+        score_parts = []
+
+        for token in safe_tokens:
+            where_parts.append(
+                f"(LOWER(COALESCE(notes, '')) LIKE '%{token}%' OR LOWER(COALESCE(chief_complaint, '')) LIKE '%{token}%')"
+            )
+            score_parts.append(
+                f"(CASE WHEN LOWER(COALESCE(notes, '')) LIKE '%{token}%' "
+                f"OR LOWER(COALESCE(chief_complaint, '')) LIKE '%{token}%' "
+                f"THEN 1 ELSE 0 END)"
+            )
+
+        where_clause = " AND ".join(where_parts)
+        score_clause = " + ".join(score_parts)
+
+        query = f"""
+        SELECT
+            patient_id,
+            encounter_id,
+            chief_complaint,
+            notes,
+            ({score_clause}) AS relevance_score,
+            LENGTH(COALESCE(notes, '')) AS note_length
+        FROM ehr_encounter
+        WHERE {where_clause}
+        ORDER BY relevance_score DESC, note_length DESC, encounter_id DESC
+        LIMIT {limit}
+        """
+        return query
+
+    def keyword_note_search(self, user_input, limit=5):
+        try:
+            print(f"🔍 Keyword note fallback: {user_input}")
+            query = self.build_note_token_query(user_input, limit=limit)
+            result = self.db.execute_query(query)
+
+            if "error" in result:
+                return f"❌ Keyword note search failed: {result['error'][:120]}"
+
+            rows = result.get("data", [])
+            if not rows:
+                return f"✅ No clinical notes found for '{user_input}'"
+
+            output = f"📝 **{len(rows)} clinical note matches for:** `{user_input}`\n\n"
+            for i, row in enumerate(rows, 1):
+                preview = (row.get("notes") or row.get("chief_complaint", "") or "").replace("\n", " ").strip()
+                if len(preview) > 220:
+                    preview = preview[:220] + "..."
+
+                output += f"{i}. **Pt {row.get('patient_id', 'N/A')}** | Encounter {row.get('encounter_id', 'N/A')}\n"
+                output += f"   🩺 {row.get('chief_complaint', 'N/A')}\n"
+                output += f"   💬 {preview}\n\n"
+
+            return output
+        except Exception as e:
+            return f"❌ Keyword note search exception: {str(e)}"
+
+    def semantic_search_with_fallback(self, user_input, limit=5):
+        print(f"🧭 Note query route: {user_input}")
+
+        milvus_result = self.semantic_search_notes(user_input, limit=limit)
+        if milvus_result:
+            return milvus_result
+
+        print("📝 Falling back to keyword note search...")
+        return self.keyword_note_search(user_input, limit=limit)
+
+    def classify_intent_llm(self, user_input):
+        prompt = f"""
+Classify this healthcare chatbot request into exactly ONE label from: help, dashboard, semantic, sql, hybrid
+
+Rules:
+- help = asking what bot can do (help, ?, what can you do)
+- dashboard = wants stats/summary (dashboard, stats, overview, summary)
+- semantic = clinical notes, symptoms, diagnoses (notes, chest pain, diabetes, symptoms)
+- sql = structured data (labs, patients, medications, claims, devices)
+- hybrid = both clinical notes AND structured data
+
+Query: "{user_input}"
+
+Respond with ONLY one word: help/dashboard/semantic/sql/hybrid
+"""
+        result = self.ask_ollama(prompt, timeout=15)
+        if result and result.strip().lower() in ["help", "dashboard", "semantic", "sql", "hybrid"]:
+            return result.strip().lower()
+        return "sql"
+
+    def hybrid_search_response(self, user_input):
+        note_output = self.semantic_search_with_fallback(user_input, limit=3)
+
+        sql_rows = []
+        sql_prompt = f"""
+Generate ONE MySQL SELECT query for: "{user_input}"
+
+Tables:
+- patient_demographics
+- ehr_encounter
+- lab_result
+- pharmacy_medication
+- claims_encounter
+- procedure_record
+- remote_device_reading
+
+Use LIMIT 10.
+Return ONLY SQL.
+"""
+        sql_query = self.ask_ollama(sql_prompt)
+
+        if sql_query and sql_query.strip().upper().startswith("SELECT"):
+            result = self.db.execute_query(sql_query)
+            if "error" not in result:
+                sql_rows = result.get("data", [])
+
+        output = f"🔍 **Hybrid results for:** `{user_input}`\n\n"
+
+        if note_output and not note_output.startswith("✅ No clinical notes found"):
+            output += note_output + "\n"
+        else:
+            output += "🧠 No semantic note matches found\n\n"
+
+        if sql_rows:
+            output += f"📊 **Structured data ({len(sql_rows)}):**\n"
+            for row in sql_rows[:3]:
+                preview = ", ".join([f"{k}={v}" for k, v in list(row.items())[:4]])
+                output += f"• {preview}\n"
+        else:
+            output += "📊 No structured data found\n"
+
+        return output
+
     def format_results(self, data, question):
-        """Doctor-friendly result formatting"""
         if not data:
             return "✅ No matching records found"
-        
+
         total = len(data)
-        
-        # Patient demographics
-        if any(word in question.lower() for word in ['patient', 'demographic', 'name', 'age', 'city']):
+        question_lower = question.lower()
+
+        if any(word in question_lower for word in ["patient", "demo", "name", "age", "city"]):
             patients = []
-            for row in data[:10]:
-                name = f"{row.get('first_name', 'N/A')} {row.get('last_name', 'N/A')}"
-                age = self.calculate_age(row.get('date_of_birth'))
-                city = row.get('city', 'N/A')
-                patients.append(f"• {name}, {age}yo ({city})")
-            return f"👥 **{total} patients found:**\n" + "\n".join(patients)
-        
-        # Lab results with emojis
-        elif 'lab' in question.lower():
+            for row in data[:8]:
+                name = f"{row.get('first_name', '')} {row.get('last_name', '')}".strip()
+                age = self.calculate_age(row.get("date_of_birth"))
+                city = row.get("city", "N/A")
+                patients.append(f"• {name or 'N/A'}, {age}yo ({city})")
+            return f"👥 **{total} patients:**\n" + "\n".join(patients)
+
+        elif "lab" in question_lower:
             labs = []
             for row in data[:10]:
-                test = row.get('test_name', 'Unknown')
-                result = row.get('result_value', 'N/A')
-                flag = row.get('abnormal_flag', 'Normal')
-                
-                if flag in ['High', 'Low', 'Critical']:
-                    emoji = "🔴"
-                elif flag == 'Borderline':
-                    emoji = "🟡"
-                else:
-                    emoji = "🟢"
-                
+                test = row.get("test_name", "Unknown")
+                result = row.get("result_value", row.get("result_numeric", "N/A"))
+                flag = row.get("abnormal_flag", "Normal")
+                emoji = {"High": "🔴", "Low": "🔴", "Critical": "🔴", "Borderline": "🟡"}.get(flag, "🟢")
                 labs.append(f"• {test}: {result} {emoji}")
-            return f"🧪 **{total} lab results:**\n" + "\n".join(labs)
-        
-        # Medications
-        elif any(word in question.lower() for word in ['medication', 'pharmacy', 'prescription']):
+            return f"🧪 **{total} labs:**\n" + "\n".join(labs)
+
+        elif any(word in question_lower for word in ["med", "pharm", "rx"]):
             meds = []
-            for row in data[:10]:
-                med = row.get('medication_name', 'Unknown')
-                dosage = row.get('dosage', 'N/A')
-                frequency = row.get('frequency', 'N/A')
-                meds.append(f"• {med} ({dosage}, {frequency})")
+            for row in data[:8]:
+                med = row.get("medication_name", "Unknown")
+                dosage = row.get("dosage", "N/A")
+                meds.append(f"• {med} ({dosage})")
             return f"💊 **{total} medications:**\n" + "\n".join(meds)
-        
-        # Encounters/Procedures
-        elif any(word in question.lower() for word in ['encounter', 'procedure', 'visit']):
+
+        elif any(word in question_lower for word in ["encounter", "visit", "proc"]):
             visits = []
-            for row in data[:10]:
-                type_ = row.get('encounter_type', row.get('procedure_name', 'Visit'))
-                date = row.get('encounter_start', row.get('procedure_date', 'N/A'))
-                visits.append(f"• {type_}: {date}")
-            return f"🏥 **{total} encounters:**\n" + "\n".join(visits)
-        
-        # Claims
-        elif 'claim' in question.lower():
-            claims = []
-            for row in data[:5]:
-                status = row.get('claim_status', 'Unknown')
-                amount = row.get('paid_amount', 0)
-                status_emoji = "✅" if status == 'Paid' else "❌" if status == 'Denied' else "⏳"
-                claims.append(f"• {status_emoji} {status}: ${amount:,.0f}")
-            return f"💰 **{total} claims:**\n" + "\n".join(claims)
-        
-        # Device readings
-        elif 'device' in question.lower():
-            readings = []
-            for row in data[:10]:
-                device = row.get('device_type', 'Unknown')
-                value = row.get('reading_value', 'N/A')
-                readings.append(f"• {device}: {value}")
-            return f"📱 **{total} device readings:**\n" + "\n".join(readings)
-        
-        # Default table preview
+            for row in data[:8]:
+                type_ = row.get("chief_complaint") or row.get("procedure_description", "Visit")
+                visits.append(f"• {str(type_)[:50]}...")
+            return f"🏥 **{total} encounters/procedures:**\n" + "\n".join(visits)
+
         else:
             preview = []
             for row in data[:5]:
-                row_str = ", ".join([f"{k}: {v}" for k, v in list(row.items())[:4]])
+                row_str = ", ".join([f"{k}={v}" for k, v in list(row.items())[:4]])
                 preview.append(row_str)
-            return f"📋 **{total} records preview:**\n" + "\n".join(preview)
-    
+            return f"📋 **{total} records:**\n" + "\n".join(preview)
+
     def calculate_age(self, dob_str):
-        """Calculate age from date of birth"""
-        if not dob_str or dob_str == 'N/A':
-            return 'N/A'
+        if not dob_str or dob_str == "N/A":
+            return "N/A"
         try:
-            dob = datetime.strptime(dob_str, '%Y-%m-%d')
+            if isinstance(dob_str, str):
+                dob = datetime.strptime(dob_str[:10], "%Y-%m-%d")
+            else:
+                dob = dob_str
             today = datetime.now()
             age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
             return str(age)
-        except:
-            return 'N/A'
-    
-    def get_response(self, user_input):
-        user_input_lower = user_input.lower().strip()
-        
-        # Exit commands
-        if user_input_lower in ['quit', 'exit', 'bye', 'q']:
-            return None
-        
-        # Help/System commands
-        if any(word in user_input_lower for word in ['help', 'h', '?']):
-            return self.get_help()
-        
-        # Dashboard/Stats
-        if any(word in user_input_lower for word in ['dashboard', 'stats', 'overview', 'summary', 'status']):
-            return self.get_dashboard()
-        
-        # Milvus semantic search (PRIORITY 1)
-        semantic_keywords = [
-            'note', 'notes', 'find notes', 'chest pain', 'diabetes', 'hypertension', 
-            'pain', 'symptom', 'similar', 'summary', 'summarize', 'clinical'
-        ]
-        if any(keyword in user_input_lower for keyword in semantic_keywords):
-            return self.semantic_search_notes(user_input)
-        
-        # Quick lookups (PRIORITY 2)
-        quick_patterns = {
-            'patients by city': "SELECT city, COUNT(*) as count FROM patient_demographics GROUP BY city ORDER BY count DESC LIMIT 10",
-            'abnormal labs': "SELECT test_name, result_value, abnormal_flag FROM lab_result WHERE abnormal_flag != 'Normal' ORDER BY result_time DESC LIMIT 10",
-            'recent encounters': "SELECT patient_id, encounter_type, encounter_start FROM ehr_encounter ORDER BY encounter_start DESC LIMIT 10",
-            'paid claims': "SELECT patient_id, paid_amount, claim_status FROM claims_encounter WHERE claim_status = 'Paid' ORDER BY claim_date DESC LIMIT 10",
-            'diabetes meds': "SELECT medication_name, dosage FROM pharmacy_medication WHERE medication_name LIKE '%diabetes%' OR medication_name LIKE '%insulin%' LIMIT 10"
-        }
-        
-        for pattern, query in quick_patterns.items():
-            if pattern in user_input_lower:
-                result = self.db.execute_query(query)
-                if "error" not in result:
-                    return self.format_results(result['data'], user_input)
-        
-        # Ollama SQL generation (PRIORITY 3 - fallback)
-        return self.generate_sql_response(user_input)
-    
+        except Exception:
+            return "N/A"
+
     def get_help(self):
-        """Comprehensive help with examples"""
-        return """🏥 **HealthDataBot Pro - 8 Table Healthcare Database**
+        return """🏥 **HealthDataBot Pro** - Smart Healthcare AI
 
-**🔍 QUICK COMMANDS:**
-• `dashboard` - See all stats
-• `help` - This help
-• `quit` - Exit
+**🚀 QUICK START:**
+• `chest pain notes`
+• `dashboard`
+• `help`
+• `quit`
 
-**🧠 SEMANTIC SEARCH (Milvus - 836 notes):**
+**🧠 NOTE SEARCH:**
 • "chest pain notes"
-• "diabetes complications" 
-• "hypertension symptoms"
-• "find similar notes"
+• "diabetes complications"
+• "hypertension management"
 
-**👥 PATIENTS (1,000 records):**
-• "New York patients"
-• "patients by city"
-• "recent patients"
-
-**🧪 LABS (500 results):**
-• "abnormal labs"
-• "diabetes labs"
-• "recent lab results"
-
-**💊 MEDICATIONS (1,000 records):**
-• "diabetes medications"
-• "recent prescriptions"
-
-**🏥 ENCOUNTERS (1,000 visits):**
-• "recent encounters"
-• "telehealth visits"
-
-**📱 DEVICES (1,000 readings):**
-• "recent device readings"
-• "heart rate data"
-
-**💰 CLAIMS (1,000 records):**
-• "paid claims"
-• "denied claims"
-
-**Examples:**
-`show me chest pain notes`
-`patients in Florida`
-`abnormal hemoglobin labs`
+**📊 STRUCTURED DATA:**
+• "abnormal A1C labs"
+• "metformin patients"
+• "unpaid claims"
+• "heart rate alerts"
 """
-    
+
     def get_dashboard(self):
-        """Enhanced dashboard with KPIs"""
         stats_query = """
-        SELECT 
-            (SELECT COUNT(*) FROM patient_demographics) as total_patients,
-            (SELECT COUNT(*) FROM ehr_encounter) as total_encounters,
-            (SELECT COUNT(*) FROM lab_result WHERE abnormal_flag != 'Normal') as abnormal_labs,
-            (SELECT COUNT(*) FROM pharmacy_medication) as total_meds,
-            (SELECT COUNT(*) FROM claims_encounter WHERE claim_status = 'Paid') as paid_claims,
-            (SELECT COUNT(*) FROM remote_device_reading WHERE reading_type = 'Heart Rate') as heart_rate_readings,
-            (SELECT COUNT(*) FROM procedure_record) as total_procedures
+        SELECT
+            (SELECT COUNT(*) FROM patient_demographics) AS total_patients,
+            (SELECT COUNT(*) FROM ehr_encounter) AS total_encounters,
+            (SELECT COUNT(*)
+             FROM lab_result
+             WHERE abnormal_flag IS NOT NULL
+               AND TRIM(abnormal_flag) <> ''
+               AND UPPER(abnormal_flag) <> 'NORMAL') AS abnormal_labs,
+            (SELECT COUNT(*) FROM pharmacy_medication) AS total_meds,
+            (SELECT COUNT(*) FROM claims_encounter WHERE UPPER(claim_status) = 'PAID') AS paid_claims,
+            (SELECT COUNT(*)
+             FROM remote_device_reading
+             WHERE LOWER(COALESCE(measurement_type, '')) LIKE '%heart%'
+                OR LOWER(COALESCE(measurement_type, '')) LIKE '%hr%') AS heart_rate_readings,
+            (SELECT COUNT(*) FROM procedure_record) AS total_procedures
         """
         result = self.db.execute_query(stats_query)
-        if "error" in result or not result['data']:
-            return "❌ Dashboard query failed"
-        
-        row = result['data'][0]
-        return f"""🏥 **HEALTHCARE DASHBOARD** (Updated {datetime.now().strftime('%H:%M:%S')})
+        if "error" in result or not result.get("data"):
+            return "❌ Dashboard unavailable"
 
-👥 **Patients:** {row['total_patients']:,} total
-🏥 **Encounters:** {row['total_encounters']:,} visits  
+        row = result["data"][0]
+        milvus_status = "✅ connected" if self.milvus else "⚠️ disabled"
+
+        return f"""🏥 **DASHBOARD** ({datetime.now().strftime('%H:%M')})
+
+👥 **Patients:** {row['total_patients']:,}
+🏥 **Encounters:** {row['total_encounters']:,}
 🧪 **Abnormal Labs:** {row['abnormal_labs']:,} 🔴
-💊 **Medications:** {row['total_meds']:,} scripts
-💰 **Paid Claims:** ${row.get('paid_claims', 0):,}
-📱 **Heart Rate Readings:** {row.get('heart_rate_readings', 0):,}
+💊 **Medications:** {row['total_meds']:,}
+💰 **Paid Claims:** {row.get('paid_claims', 0):,}
+📱 **Heart Rate:** {row.get('heart_rate_readings', 0):,}
 🔪 **Procedures:** {row.get('total_procedures', 0):,}
 
-🧠 **Milvus:** 836 clinical note embeddings ready
+🧠 **Milvus:** {milvus_status}
 """
-    
-    def generate_sql_response(self, user_input):
-        """Ollama SQL generation with schema context"""
-        schema = self.db.get_schema()
-        schema_text = "\n".join([f"{row[0]}.{row[1]} ({row[2]})" for row in schema[:30]])
-        
-        sql_prompt = f"""Healthcare Data Analyst - Write MySQL for doctors.
 
-DATABASE SCHEMA:
+    def generate_sql_response(self, user_input):
+        schema = self.db.get_schema()
+        schema_text = "\n".join([f"{row[0]}.{row[1]}" for row in schema[:25]])
+
+        sql_prompt = f"""Healthcare SQL expert. Write ONE SELECT query.
+
+SCHEMA:
 {schema_text}
 
-TABLE RELATIONSHIPS (all linked by patient_id):
-patient_demographics ← [patient_socioeconomic, remote_device_reading, ehr_encounter, claims_encounter]
-ehr_encounter ← [lab_result, pharmacy_medication, procedure_record]
-
-IMPORTANT COLUMNS:
-patient_demographics: patient_id, first_name, last_name, city, date_of_birth
-lab_result: test_name, result_value, abnormal_flag, result_time  
-pharmacy_medication: medication_name, dosage, frequency
-ehr_encounter: encounter_type, encounter_start, notes
-claims_encounter: claim_status, paid_amount
-
 Question: "{user_input}"
-
-Write ONE clean SELECT query with:
-- LIMIT 10
-- Proper JOINs on patient_id
-- ORDER BY most relevant column
-- Return ONLY the SQL (no explanations)
-
-SQL:"""
-        
+LIMIT 10.
+Return ONLY valid SQL.
+"""
         print("🤔 Generating SQL...")
         sql_query = self.ask_ollama(sql_prompt)
-        
-        if not sql_query:
-            return "❌ Ollama timeout. Try 'dashboard' or semantic search."
-        
-        print(f"📊 SQL: {sql_query}")
-        
-        # Validate it's a SELECT query
-        if not sql_query.strip().upper().startswith('SELECT'):
-            return f"❌ Invalid SQL generated. Try 'dashboard' or 'help'"
-        
-        # Execute safely
+
+        if not sql_query or not sql_query.strip().upper().startswith("SELECT"):
+            return "❌ SQL generation failed. Try 'dashboard' or 'help'"
+
+        print(f"📊 Executing: {sql_query[:100]}...")
         result = self.db.execute_query(sql_query)
+
         if "error" in result:
-            return f"❌ Query error: {result['error']}\n💡 Try: 'dashboard' or 'help'"
-        
-        return self.format_results(result['data'], user_input)
-    
+            return f"❌ Query failed: {result['error'][:120]}..."
+
+        return self.format_results(result.get("data", []), user_input)
+
+    def get_response(self, user_input):
+        user_input_lower = (user_input or "").lower().strip()
+        print(f"🔍 Processing: '{user_input}'")
+
+        if user_input_lower in ["quit", "exit", "bye", "q"]:
+            return None
+
+        if user_input_lower in ["help", "h", "?"]:
+            return self.get_help()
+
+        if self.fuzzy_contains_intent(user_input, ["dashboard", "stats", "overview"], 85):
+            print("📊 Dashboard detected")
+            return self.get_dashboard()
+
+        note_patterns = [
+            "note", "notes", "clinical", "chart", "record", "history", "hpi",
+            "symptom", "symptoms", "complaint", "complaints", "soap", "assessment",
+            "chest pain", "chest pressure", "chest tightness", "shortness of breath",
+            "diabetes", "hypertension", "hypotension", "fever", "cough", "headache",
+            "dizziness", "nausea", "vomiting", "fatigue", "wheezing", "palpitation",
+            "edema", "dyspnea", "sob", "cp", "mi", "hf", "copd", "pna",
+            "covid", "flu", "pneumonia", "asthma", "cad", "afib", "vtach",
+            "brady", "chf", "esrd", "cirrhosis", "sepsis"
+        ]
+
+        if any(pattern in user_input_lower for pattern in note_patterns):
+            print("🧠 Note query detected")
+
+            sql_markers = ["lab", "labs", "med", "rx", "patient", "claim", "device"]
+            wants_sql = any(marker in user_input_lower for marker in sql_markers)
+
+            if wants_sql:
+                print("🔍 Hybrid request")
+                return self.hybrid_search_response(user_input)
+
+            return self.semantic_search_with_fallback(user_input)
+
+        sql_markers = ["lab", "labs", "medication", "meds", "rx", "patient", "claim", "encounter", "device"]
+        if any(marker in user_input_lower for marker in sql_markers):
+            print("📊 SQL query detected")
+            return self.generate_sql_response(user_input)
+
+        intent = self.classify_intent_llm(user_input)
+        print(f"🤖 LLM intent: {intent}")
+
+        if intent == "semantic":
+            return self.semantic_search_with_fallback(user_input)
+        if intent == "hybrid":
+            return self.hybrid_search_response(user_input)
+        if intent == "dashboard":
+            return self.get_dashboard()
+
+        return self.generate_sql_response(user_input)
+
     def start_chat(self):
-        """Main chat loop with history"""
-        print("🎯 HealthDataBot Pro is ready!\n")
-        
+        print("🎯 HealthDataBot Pro ready!\n")
+
         while True:
             try:
                 user_input = input("\nYou: ").strip()
                 if not user_input:
                     continue
-                    
+
                 response = self.get_response(user_input)
                 if response is None:
                     print("\n👋 Thanks for using HealthDataBot Pro!")
                     break
-                
-                print(f"\n{self.name}: {response}\n")
-                
+
+                print(f"\n{self.name}\n{response}\n")
+
             except KeyboardInterrupt:
                 print("\n\n👋 Goodbye!")
                 break
             except Exception as e:
-                print(f"❌ Unexpected error: {e}")
+                print(f"❌ Error: {e}")
+
 
 if __name__ == "__main__":
     chatbot = HealthcareChatbot()
