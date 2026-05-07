@@ -98,18 +98,45 @@ class HealthcareChatbot:
 
     def print_table_stats(self):
         print("📋 Checking tables:")
-        tables = {
-            "patient_demographics": 1000,
-            "patient_socioeconomic": 1000,
-            "remote_device_reading": 1000,
-            "ehr_encounter": 1000,
-            "lab_result": 500,
-            "pharmacy_medication": 1000,
-            "procedure_record": 250,
-            "claims_encounter": 1000
-        }
-        for table, count in tables.items():
-            print(f"   ✅ {table}: {count:,} rows")
+
+        expected_tables = [
+            "patient_demographics",
+            "patient_socioeconomic",
+            "remote_device_reading",
+            "ehr_encounter",
+            "lab_result",
+            "pharmacy_medication",
+            "procedure_record",
+            "claims_encounter",
+        ]
+
+        try:
+            # Try to get actual table names from the database if available
+            try:
+                db_table_names = self.db.get_table_names() or []
+            except Exception:
+                db_table_names = []
+
+            # Build an ordered list: keep expected first (if present), then append any extra DB tables
+            if db_table_names:
+                ordered = [t for t in expected_tables if t in db_table_names]
+                extras = [t for t in db_table_names if t not in ordered]
+                tables_to_check = ordered + extras
+            else:
+                tables_to_check = expected_tables
+
+            for table in tables_to_check:
+                try:
+                    count = self.db.get_row_count(table)
+                    if isinstance(count, int) and count >= 0:
+                        print(f"   ✅ {table}: {count:,} rows")
+                    else:
+                        print(f"   ⚠️ {table}: unavailable")
+                except Exception:
+                    print(f"   ⚠️ {table}: unavailable")
+
+        except Exception as e:
+            print(f"⚠️ Could not retrieve table stats: {e}")
 
     def semantic_search_notes(self, query, limit=5):
         if not self.milvus:

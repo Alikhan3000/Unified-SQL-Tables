@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 import os
 import re
 from pathlib import Path
+import requests
+import json
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -16,7 +18,9 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-me")
 
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["http://127.0.0.1:3000", "http://localhost:3000"],
+        # Allow local development origins and simple static file usage.
+        # For local dev it's simpler to allow all origins; tighten this for production.
+        "origins": "*",
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type"]
     }
@@ -31,6 +35,110 @@ def get_connection():
         password=os.getenv("MYSQL_PASSWORD", "root"),
         database=os.getenv("MYSQL_DATABASE", "unified")
     )
+
+# Load cached DB schema if available
+SCHEMA_PATH = BASE_DIR / "db_schema.json"
+DB_SCHEMA = {}
+def load_db_schema():
+    global DB_SCHEMA
+    try:
+        if SCHEMA_PATH.exists():
+            with open(SCHEMA_PATH, 'r', encoding='utf-8') as f:
+                DB_SCHEMA = json.load(f).get('tables', {})
+        else:
+            DB_SCHEMA = {}
+    except Exception:
+        DB_SCHEMA = {}
+
+load_db_schema()
+
+def get_schema_snippet_for_query(query: str, max_chars: int = 800) -> str:
+    """Return a short text snippet of relevant tables/columns for the LLM prompt."""
+    if not DB_SCHEMA:
+        return ""
+
+    q = (query or "").lower()
+    # Choose tables whose name or column names appear in the query
+    matches = []
+    for table, meta in DB_SCHEMA.items():
+        table_low = table.lower()
+        cols = list(meta.get('columns', {}).keys())
+        cols_join = ' '.join(cols).lower()
+        score = 0
+        if table_low in q:
+            score += 2
+        for c in cols:
+            if c.lower() in q:
+                score += 1
+        if score > 0:
+            matches.append((score, table, cols))
+
+    # Sort by score desc
+    matches.sort(key=lambda x: -x[0])
+
+    # If no matches, pick the top 3 tables by column count
+    if not matches:
+        picks = sorted(((len(meta.get('columns', {})), t, list(meta.get('columns', {}).keys())) for t, meta in DB_SCHEMA.items()), reverse=True)[:3]
+        matches = [(0, t, cols) for cnt, t, cols in picks]
+
+    # Build snippet
+    parts = []
+    for _, table, cols in matches:
+        parts.append(f"{table}: {', '.join(cols[:8])}")
+        if sum(len(p) for p in parts) > max_chars:
+            break
+
+    snippet = '\n'.join(parts)
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars]
+    return snippet
+
+def validate_llm_results(results):
+    """Ensure results are a list of dicts with required fields, sanitize types."""
+    if not isinstance(results, list):
+        return None
+    out = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        title = item.get('title') or item.get('label') or item.get('patient_name')
+        desc = item.get('description') or item.get('note_text') or ''
+        if not title or not desc:
+            continue
+        score = item.get('score')
+        try:
+            score = float(score) if score is not None else None
+        except Exception:
+            score = None
+        out.append({
+            'title': str(title),
+            'description': str(desc),
+            'meta': item.get('meta') or '',
+            'score': score or 0.0,
+            'patient_id': item.get('patient_id')
+        })
+    return out if out else None
+
+
+def simplify_query_for_db(q: str) -> str:
+    """Turn a natural-language query into a compact DB-friendly search string."""
+    if not q:
+        return q
+    q = q.lower()
+    stopwords = set(["the","a","an","with","for","in","on","at","to","of","and","or","patients","patient","show","find","list","where","who","have","has","is","are"]) 
+    tokens = [t.strip() for t in re.split(r"\W+", q) if t.strip()]
+    tokens = [t for t in tokens if len(t) > 2 and t not in stopwords]
+    if not tokens:
+        return q
+    # If a common multiword phrase exists, keep it (e.g., 'chest pain')
+    joined = ' '.join(tokens)
+    # Prefer keeping adjacent tokens that were phrases in original query
+    # Simple heuristic: look for 'chest pain' or 'shortness breath'
+    phrases = ["chest pain", "shortness of breath", "shortness breath", "high blood pressure", "heart rate"]
+    for p in phrases:
+        if p in q:
+            return p
+    return joined
 
 
 def safe_int(value, default=0):
@@ -508,6 +616,139 @@ def run_unified_search(q: str, limit=50):
     return results
 
 
+def call_llm_search(query: str, timeout=12):
+    """Call configured Ollama LLM to produce structured search results.
+    Returns a list of result objects or None on failure.
+    """
+    ollama_host = os.getenv("OLLAMA_HOST")
+    ollama_model = os.getenv("OLLAMA_MODEL")
+
+    if not ollama_host or not ollama_model:
+        return None
+
+    # Include a short schema snippet to help the model (keeps prompt focused)
+    schema_snippet = get_schema_snippet_for_query(query, max_chars=700)
+
+    # Strict prompt: require ONLY JSON and provide a fail-safe minimal response format.
+    prompt = (
+        "You are a helpful clinical assistant. Given the user query and the database schema below, return EXACTLY valid JSON and nothing else." +
+        "\n\nReturn a top-level object with a single key \"results\" which is an array. Each item must be an object with: \"title\" (short string), \"description\" (one-line string), optionally \"meta\" (string), optionally \"score\" (float between 0.0 and 1.0), optionally \"patient_id\" (string or number)." +
+        "\n\nIf you cannot find relevant items, return {\"results\":[]}." +
+        "\n\nSchema (short):\n" + schema_snippet +
+        "\n\nUser query: \"" + query + "\"\n\n" +
+        "Examples of valid responses:\n" +
+        "{\"results\": [{\"title\":\"Chest pain note\",\"description\":\"Patient John Smith: chest pain and SOB\",\"meta\":\"ehr_encounter:123\",\"score\":0.92,\"patient_id\":\"P001\"}]}\n" +
+        "{\"results\": []}\n\nReturn only the JSON object (no markdown, no explanation, no surrounding text, no backticks)."
+    )
+
+    # Try a couple of deterministic requests (low temperature), log raw text for debugging on failures.
+    attempts = [ {"temperature": 0.0, "top_p": 0.1}, {"temperature": 0.1, "top_p": 0.9} ]
+    raw_text = None
+    for opts in attempts:
+        try:
+            resp = requests.post(
+                f"{ollama_host}/api/generate",
+                json={
+                    "model": ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": opts["temperature"], "top_p": opts["top_p"]}
+                },
+                timeout=timeout
+            )
+            if resp.status_code != 200:
+                continue
+
+            body = resp.json()
+            raw_text = body.get("response") if isinstance(body, dict) else None
+            if not raw_text:
+                continue
+
+            # Attempt to parse JSON directly
+            try:
+                parsed = json.loads(raw_text)
+                raw_results = parsed.get("results") if isinstance(parsed, dict) else None
+            except Exception:
+                # attempt to extract JSON substring
+                raw_results = None
+                m = re.search(r"(\{\s*\"results\"[\s\S]*\})", raw_text)
+                if m:
+                    try:
+                        parsed = json.loads(m.group(1))
+                        raw_results = parsed.get("results")
+                    except Exception:
+                        raw_results = None
+
+            # Validate and sanitize results
+            validated = validate_llm_results(raw_results)
+            if validated:
+                return validated
+            # else continue to next attempt
+
+        except Exception:
+            raw_text = None
+            continue
+
+    # If we reach here, all LLM attempts failed to produce validated results.
+    try:
+        log_path = BASE_DIR / "llm_debug.log"
+    except Exception:
+        log_path = Path("llm_debug.log")
+
+    try:
+        with open(log_path, 'a', encoding='utf-8') as lf:
+            from datetime import datetime
+            lf.write(f"--- {datetime.utcnow().isoformat()}Z QUERY: {query}\n")
+            lf.write((raw_text or "<no-response>") + "\n\n")
+    except Exception:
+        pass
+
+    # As a last resort, synthesize LLM-like results from the DB so the LLM-path returns useful data
+    try:
+        search_q = simplify_query_for_db(query)
+        raw = run_unified_search(search_q, limit=20)
+        emu = []
+        for r in raw[:20]:
+            title = r.get("patient_name") or f"Patient {r.get('patient_id') or ''}".strip()
+            desc = r.get("note_text") or ''
+            meta = r.get("source_table")
+            emu.append({"title": title, "description": desc, "meta": f"synthetic:{meta}", "score": 0.65, "patient_id": r.get("patient_id")})
+        return emu if emu else None
+    except Exception:
+        return None
+
+
+@app.route("/api/llm_search", methods=["POST"])
+def llm_search():
+    try:
+        data = request.get_json(silent=True) or {}
+        q = (data.get("query") or "").strip()
+        if not q:
+            return jsonify({"results": []})
+
+        # Try LLM first
+        llm_results = call_llm_search(q)
+        if llm_results:
+            return jsonify({"results": llm_results})
+
+        # Fallback to DB unified search (use a simplified query for better LIKE matches)
+        search_q = simplify_query_for_db(q)
+        raw = run_unified_search(search_q, limit=20)
+        mapped = []
+        for r in raw:
+            title = r.get("patient_name") or f"Patient {r.get('patient_id') or ''}".strip()
+            desc = r.get("note_text") or ''
+            meta = r.get("source_table")
+            mapped.append({"title": title, "description": desc, "meta": meta, "score": 0.5, "patient_id": r.get("patient_id")})
+
+        return jsonify({"results": mapped})
+
+    except Error as e:
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def build_chat_response(message: str):
     intent = classify_intent(message)
     limit = extract_limit(message, default=10, max_limit=50)
@@ -620,6 +861,15 @@ def get_patients():
         limit = min(max(limit, 1), 50)
         rows = fetch_patient_list(limit)
         return jsonify({"patients": rows})
+    except Error as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/stats", methods=["GET"])
+def get_stats():
+    try:
+        stats = fetch_stats_data()
+        return jsonify(stats)
     except Error as e:
         return jsonify({"error": str(e)}), 500
 

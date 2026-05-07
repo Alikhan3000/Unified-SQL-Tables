@@ -592,30 +592,50 @@
     function runSearch() {
       const query = document.getElementById("search-input").value.trim().toLowerCase();
       if (!query) return;
+      const apiBase = 'http://127.0.0.1:5000';
 
-      let results = [];
-      
-      if (query.includes('chest') || query.includes('pain')) {
-        results = [
-          { title: "Chest pain notes found", description: "John Smith: 'Intermittent chest pain x 3 days, SOB on exertion'", risk_label: "High", meta: "Note ID: N123" },
-          { title: "Related labs", description: "Elevated troponin I (0.12 ng/mL)", meta: "Lab ID: L456" }
-        ];
-      } else if (query.includes('diabetic') || query.includes('hba1c')) {
-        results = [
-          { title: "Mary Johnson - uncontrolled DM", description: "HbA1c 9.2%, multiple abnormal labs", risk_label: "High", meta: "Patient P002" },
-          { title: "Glucose trends", description: "Fasting glucose >180 mg/dL x 3", meta: "Lab trend" }
-        ];
-      } else if (query.includes('lab')) {
-        results = [
-          { title: "342 abnormal lab results", description: "Top issues: HbA1c, troponin, creatinine", meta: `${FAKE_STATS.abnormal_labs} total` }
-        ];
-      } else {
-        results = [
-          { title: `Demo search: "${query}"`, description: "Full-text search across 2847 encounters + clinical notes", meta: "Production LLM search ready" }
-        ];
-      }
+      fetch(`${apiBase}/api/llm_search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query })
+      }).then(r => r.ok ? r.json() : Promise.reject(r.status))
+        .then(payload => {
+          const results = payload.results || [];
+          if (results.length > 0) {
+            renderResults(results, `${results.length} matches`);
+            return;
+          }
 
-      renderResults(results, `${results.length} matches`);
+          // no results from LLM; show a helpful demo result
+          renderResults([{ title: `No LLM results for \"${query}\"`, description: 'Try a different query or start the backend API.', meta: '' }], '0 matches');
+        })
+        .catch(err => {
+          console.warn('LLM search failed, falling back to demo logic', err);
+
+          // FALLBACK: previous demo behavior
+          let results = [];
+          if (query.includes('chest') || query.includes('pain')) {
+            results = [
+              { title: "Chest pain notes found", description: "John Smith: 'Intermittent chest pain x 3 days, SOB on exertion'", risk_label: "High", meta: "Note ID: N123" },
+              { title: "Related labs", description: "Elevated troponin I (0.12 ng/mL)", meta: "Lab ID: L456" }
+            ];
+          } else if (query.includes('diabetic') || query.includes('hba1c')) {
+            results = [
+              { title: "Mary Johnson - uncontrolled DM", description: "HbA1c 9.2%, multiple abnormal labs", risk_label: "High", meta: "Patient P002" },
+              { title: "Glucose trends", description: "Fasting glucose >180 mg/dL x 3", meta: "Lab trend" }
+            ];
+          } else if (query.includes('lab')) {
+            results = [
+              { title: "342 abnormal lab results", description: "Top issues: HbA1c, troponin, creatinine", meta: `${FAKE_STATS.abnormal_labs} total` }
+            ];
+          } else {
+            results = [
+              { title: `Demo search: "${query}"`, description: "Full-text search across 2847 encounters + clinical notes", meta: "Production LLM search ready" }
+            ];
+          }
+
+          renderResults(results, `${results.length} matches`);
+        });
     }
 
     function runQuickCommand(command) {
@@ -624,20 +644,59 @@
     }
 
     function loadDashboard() {
-      // Animate metrics loading
-      animateCounter(document.getElementById("total-patients"), FAKE_STATS.total_patients);
-      animateCounter(document.getElementById("abnormal-labs"), FAKE_STATS.abnormal_labs);
-      animateCounter(document.getElementById("encounters-count"), FAKE_STATS.total_encounters);
-      animateCounter(document.getElementById("high-risk-count"), FAKE_STATS.high_risk_count);
+      // Try to load live data from backend; fall back to FAKE_STATS on error
+      const apiBase = 'http://127.0.0.1:5000';
 
-      allPatients = [...FAKE_PATIENTS];
-      renderPatients(allPatients);
+      Promise.all([
+        fetch(`${apiBase}/api/stats`).then(r => r.ok ? r.json() : Promise.reject(r.status)),
+        fetch(`${apiBase}/api/patients?limit=10`).then(r => r.ok ? r.json() : Promise.reject(r.status))
+      ]).then(([stats, patientsResp]) => {
+        const patients = (patientsResp && patientsResp.patients) || patientsResp || [];
 
-      initCharts();
+        animateCounter(document.getElementById("total-patients"), stats.total_patients || 0);
+        animateCounter(document.getElementById("abnormal-labs"), stats.abnormal_labs || 0);
+        animateCounter(document.getElementById("encounters-count"), stats.total_encounters || 0);
+        animateCounter(document.getElementById("high-risk-count"), stats.high_risk_patients || 0);
 
-      renderResults([
-        { title: "Dashboard Active", description: "✅ 1,000 patients loaded<br>✅ Live risk scoring<br>✅ Clinical search ready<br>✅ Production-grade demo" }
-      ], "Demo Mode Active");
+        // map backend patient fields to the simple UI shape
+        allPatients = (patients.map(p => ({
+          patient_id: p.patient_id,
+          patient_name: p.patient_name || `${p.first_name || ''} ${p.last_name || ''}`,
+          date_of_birth: p.date_of_birth || p.date_of_birth,
+          age: p.age || p.encounter_count || '--',
+          city: p.city || p.state || '--',
+          state: p.state_province || p.state || '--',
+          latest_complaint: p.latest_complaint || p.note_text || '--',
+          latest_note: p.latest_note || p.note_text || '--',
+          abnormal_labs: p.abnormal_lab_count || p.abnormal_labs || 0,
+          encounter_count: p.encounter_count || 0,
+          med_count: p.medication_count || p.med_count || 0,
+          device_alerts: p.device_alert_count || 0
+        })) || []);
+
+        renderPatients(allPatients);
+        initCharts();
+
+        renderResults([
+          { title: "Dashboard Active", description: `✅ ${stats.total_patients || 0} patients loaded<br>✅ Live risk scoring<br>✅ Clinical search ready` }
+        ], "Live Data")
+
+      }).catch(err => {
+        // Fallback to demo data when backend not reachable
+        console.warn('Live dashboard fetch failed, using demo data.', err);
+        animateCounter(document.getElementById("total-patients"), FAKE_STATS.total_patients);
+        animateCounter(document.getElementById("abnormal-labs"), FAKE_STATS.abnormal_labs);
+        animateCounter(document.getElementById("encounters-count"), FAKE_STATS.total_encounters);
+        animateCounter(document.getElementById("high-risk-count"), FAKE_STATS.high_risk_count);
+
+        allPatients = [...FAKE_PATIENTS];
+        renderPatients(allPatients);
+        initCharts();
+
+        renderResults([
+          { title: "Dashboard Demo", description: "✅ Demo data active — start the Flask API to enable live data." }
+        ], "Demo Mode Active");
+      });
     }
 
     // Filter functionality
